@@ -4,7 +4,6 @@ local obs = obslua
 local g_props = nil
 local g_settings = nil
 
-local P_USE_CURRENT = "use_current_scene"
 local P_SCENE       = "scene"
 local P_QUERY       = "query"
 local P_MATCHES     = "matches"
@@ -17,45 +16,39 @@ local function log(fmt, ...)
     obs.script_log(obs.LOG_INFO, string.format("[source_tools_min] "..fmt, ...))
 end
 
-local function get_current_scene_source()
-    return obs.obs_frontend_get_current_scene()
+-- Frontend-safe: enumerate scenes via frontend list (more reliable than obs_enum_sources)
+local function list_all_scenes()
+    local names = {}
+    local arr = obs.obs_frontend_get_scenes()
+    if not arr or #arr == 0 then
+        log("No scenes found via obs_frontend_get_scenes().")
+        return names
+    end
+    for _, src in ipairs(arr) do
+        if src ~= nil then
+            local nm = obs.obs_source_get_name(src)
+            if nm and nm ~= "" then table.insert(names, nm) end
+            -- Release each retained scene source from the frontend list
+            obs.obs_source_release(src)
+        end
+    end
+    table.sort(names, function(a,b) return a:lower() < b:lower() end)
+    return names
 end
 
 local function get_scene_source_by_name(name)
     if not name or name == "" then return nil end
     local src = obs.obs_get_source_by_name(name)
-    if not src then return nil end
+    if not src then
+        log("get_scene_source_by_name: '%s' not found.", name)
+        return nil
+    end
     if obs.obs_source_get_type(src) ~= obs.OBS_SOURCE_TYPE_SCENE then
+        log("Source '%s' exists but is not a Scene type.", name)
         obs.obs_source_release(src)
         return nil
     end
     return src
-end
-
-local function list_all_scenes()
-    local scenes = {}
-    local all = obs.obs_enum_sources()
-    if all ~= nil then
-        for _, s in ipairs(all) do
-            if obs.obs_source_get_type(s) == obs.OBS_SOURCE_TYPE_SCENE then
-                table.insert(scenes, obs.obs_source_get_name(s))
-            end
-        end
-        obs.source_list_release(all)
-    end
-    table.sort(scenes, function(a,b) return a:lower() < b:lower() end)
-    return scenes
-end
-
-local function get_selected_scene_source(settings)
-    if obs.obs_data_get_bool(settings, P_USE_CURRENT) then
-        return get_current_scene_source()
-    end
-    local name = obs.obs_data_get_string(settings, P_SCENE)
-    if name == nil or name == "" or name == "<Current Scene>" then
-        return get_current_scene_source()
-    end
-    return get_scene_source_by_name(name)
 end
 
 local function get_scene_items(scene_src)
@@ -75,13 +68,35 @@ local function get_scene_items(scene_src)
     return out
 end
 
+-- If user hasn't picked a scene yet, auto-select the first available (once)
+local function ensure_scene_selected(settings)
+    local chosen = obs.obs_data_get_string(settings, P_SCENE)
+    if chosen and chosen ~= "" then return end
+    local all = list_all_scenes()
+    if #all > 0 then
+        obs.obs_data_set_string(settings, P_SCENE, all[1])
+        log("Auto-selected first scene: %s", all[1])
+    else
+        log("No scenes available to auto-select.")
+    end
+end
+
 -- ---------- matching (plain, case-insensitive) ----------
 local function compute_matches(settings)
     local query = (obs.obs_data_get_string(settings, P_QUERY) or ""):lower()
     local matches = {}
 
-    local scene_src = get_selected_scene_source(settings)
-    if scene_src == nil then return matches end
+    local name = obs.obs_data_get_string(settings, P_SCENE)
+    if not name or name == "" then
+        log("compute_matches: No scene selected.")
+        return matches
+    end
+
+    local scene_src = get_scene_source_by_name(name)
+    if scene_src == nil then
+        log("compute_matches: Selected scene '%s' not found.", name or "<nil>")
+        return matches
+    end
 
     local items = get_scene_items(scene_src)
     for _, rec in ipairs(items) do
@@ -98,9 +113,25 @@ end
 local function refresh_scene_list(prop, props, settings)
     if not prop then return end
     obs.obs_property_list_clear(prop)
-    obs.obs_property_list_add_string(prop, "<Current Scene>", "<Current Scene>")
-    for _, s in ipairs(list_all_scenes()) do
+
+    local scenes = list_all_scenes()
+    if #scenes == 0 then
+        obs.obs_property_list_add_string(prop, "(no scenes found)", "")
+        return
+    end
+    for _, s in ipairs(scenes) do
         obs.obs_property_list_add_string(prop, s, s)
+    end
+
+    -- Keep selected value if still present; otherwise pick first
+    local current = obs.obs_data_get_string(settings, P_SCENE)
+    local has = false
+    for _, s in ipairs(scenes) do
+        if s == current then has = true; break end
+    end
+    if not has then
+        obs.obs_data_set_string(settings, P_SCENE, scenes[1])
+        log("Scene selection updated to: %s", scenes[1])
     end
 end
 
@@ -109,8 +140,8 @@ local function refresh_matches_property(props, settings)
     if not list_prop then return end
 
     local prev = obs.obs_data_get_string(settings, P_MATCHES)
-
     obs.obs_property_list_clear(list_prop)
+
     local m = compute_matches(settings)
     if #m == 0 then
         obs.obs_property_list_add_string(list_prop, "(no matches)", "(no matches)")
@@ -130,7 +161,7 @@ end
 
 local function on_prop_modified(props, prop, settings)
     local id = obs.obs_property_name(prop)
-    if id == P_USE_CURRENT or id == P_SCENE or id == P_QUERY or id == P_MATCHES then
+    if id == P_SCENE or id == P_QUERY or id == P_MATCHES then
         refresh_matches_property(props, settings)
     end
     return true
@@ -138,13 +169,20 @@ end
 
 -- ---------- actions ----------
 local function with_scene_items(settings, fn)
-    local scene_src = get_selected_scene_source(settings)
+    local name = obs.obs_data_get_string(settings, P_SCENE)
+    if not name or name == "" then
+        log("with_scene_items: No scene selected.")
+        return
+    end
+    local scene_src = get_scene_source_by_name(name)
     if not scene_src then return end
+
     local scene = obs.obs_scene_from_source(scene_src)
     if not scene then
         obs.obs_source_release(scene_src)
         return
     end
+
     local items = obs.obs_scene_enum_items(scene)
     if items ~= nil then
         fn(items)
@@ -196,7 +234,8 @@ end
 function script_description()
     return [[
 <b>Minimal Source Tools</b><br/>
-• Type to search sources in a scene (plain, case-insensitive).<br/>
+• Pick a scene from the dropdown (mandatory).<br/>
+• Type to search sources in that scene (plain, case-insensitive).<br/>
 • Select a match, then <i>Move Selected Match to TOP</i>.<br/>
 • Or <i>Hide ALL Sources</i> in the scene.
 ]]
@@ -206,11 +245,7 @@ function script_properties()
     local props = obs.obs_properties_create()
     g_props = props
 
-    -- Follow current scene
-    local p_use_current = obs.obs_properties_add_bool(props, P_USE_CURRENT, "Use Current Scene")
-    obs.obs_property_set_modified_callback(p_use_current, on_prop_modified)
-
-    -- Scene picker
+    -- Scene picker (mandatory)
     local p_scene = obs.obs_properties_add_list(
         props, P_SCENE, "Scene",
         obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING
@@ -239,19 +274,15 @@ end
 
 function script_update(settings)
     g_settings = settings
+    ensure_scene_selected(settings)
 
-    -- Disable scene picker if following current
     local p_scene = obs.obs_properties_get(g_props, P_SCENE)
-    local use_current = obs.obs_data_get_bool(settings, P_USE_CURRENT)
-    if p_scene then obs.obs_property_set_enabled(p_scene, not use_current) end
-
     refresh_scene_list(p_scene, g_props, settings)
     refresh_matches_property(g_props, settings)
 end
 
 function script_defaults(settings)
-    obs.obs_data_set_bool(settings, P_USE_CURRENT, true)
-    obs.obs_data_set_string(settings, P_SCENE, "<Current Scene>")
+    obs.obs_data_set_string(settings, P_SCENE, "")
     obs.obs_data_set_string(settings, P_QUERY, "")
     obs.obs_data_set_string(settings, P_MATCHES, "(no matches)")
 end
